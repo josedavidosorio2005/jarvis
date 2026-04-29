@@ -1,0 +1,17 @@
+{
+  "facts": [
+    {
+      "text": "mi nombre es airon",
+      "created_at": "2026-04-29T16:29:29"
+    }
+  ],
+  "tasks": [
+    {
+      "text": "revisar manana",
+      "done": false,
+      "created_at": "2026-04-29T16:29:36"
+    }
+  ],
+  "favorites": {},
+  "routines": {}
+}
