@@ -55,8 +55,8 @@ def main():
                 audio_buffer.append(chunk)
                 if rms < threshold:
                     silence_chunks += 1
-                    # 4000 frames @ 16000Hz = 0.25s per chunk. 8 chunks = 2 seconds
-                    if silence_chunks > 8:
+                    # 4000 frames @ 16000Hz = 0.25s per chunk. 4 chunks = 1 second
+                    if silence_chunks > 4:
                         break
                 else:
                     silence_chunks = 0

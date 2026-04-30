@@ -540,6 +540,7 @@ class Jarvis:
             (re.compile(r"^(fecha|que fecha es)$", re.I), self.tell_date),
             (re.compile(r"^(?:abre|abrir|abri) (.+)$", re.I), self.open_target),
             (re.compile(r"^(?:busca|buscar)(?: en internet| en google)? (.+)$", re.I), self.search_web),
+            (re.compile(r"^(?:reproduce|pon|escucha)(?: a)? (.+?)(?: en youtube)?$", re.I), self.play_youtube),
             (re.compile(r"^escribe (.+)$", re.I), self.type_text),
             (re.compile(r"^presiona (.+)$", re.I), self.press_key),
             (re.compile(r"^atajo (.+)$", re.I), self.hotkey),
@@ -566,6 +567,7 @@ class Jarvis:
             (re.compile(r"^decir (.+)$", re.I), self.say),
             (re.compile(r"^lista procesos$", re.I), self.list_processes),
             (re.compile(r"^ejecuta powershell (.+)$", re.I), self.run_powershell),
+            (re.compile(r"^(limpia|borra) (cache|archivos temporales|temporales|sistema)$", re.I), self.clean_system),
             (re.compile(r"^espera (\d+)$", re.I), self.wait),
         ]
         self.load_plugins()
@@ -755,6 +757,25 @@ class Jarvis:
         query = match.group(1).strip()
         webbrowser.open("https://www.google.com/search?q=" + quote_plus(query))
         return ActionResult(True, f"Buscando {query}.")
+
+    def play_youtube(self, match: re.Match[str]) -> ActionResult:
+        query = match.group(1).strip()
+        import urllib.request
+        import urllib.parse
+        import re
+        
+        try:
+            self.speak(f"Buscando {query} en YouTube...")
+            html = urllib.request.urlopen("https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query))
+            video_ids = re.findall(r"watch\?v=(\S{11})", html.read().decode('utf-8'))
+            if video_ids:
+                webbrowser.open(f"https://www.youtube.com/watch?v={video_ids[0]}")
+                return ActionResult(True, f"Reproduciendo {query} en YouTube.")
+            else:
+                webbrowser.open("https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query))
+                return ActionResult(True, f"No encontré el video exacto, abriendo resultados de {query}.")
+        except Exception as e:
+            return ActionResult(False, f"Error al buscar en YouTube: {e}")
 
     def type_text(self, match: re.Match[str]) -> ActionResult:
         require_pyautogui()
@@ -951,6 +972,29 @@ class Jarvis:
         seconds = min(int(match.group(1)), 3600)
         time.sleep(seconds)
         return ActionResult(True, f"Esperé {seconds} segundos.")
+
+    def clean_system(self, _: re.Match[str]) -> ActionResult:
+        import base64
+        script = (
+            'Remove-Item -Path "C:\\Windows\\SoftwareDistribution\\Download\\*" -Recurse -Force -ErrorAction SilentlyContinue\n'
+            'Remove-Item -Path "$env:TEMP\\*" -Recurse -Force -ErrorAction SilentlyContinue\n'
+            'Remove-Item -Path "C:\\Windows\\Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue\n'
+        )
+        encoded = base64.b64encode(script.encode('utf-16le')).decode('utf-8')
+        
+        # Using Start-Process to request UAC (run as admin)
+        ps_cmd = f'Start-Process powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-EncodedCommand", "{encoded}" -Verb RunAs'
+        
+        self.speak("Ejecutando limpieza del sistema. Por favor acepta los permisos de Administrador si Windows te los pide.")
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        if completed.returncode == 0:
+            return ActionResult(True, "Orden de limpieza enviada. (Se ejecutará en segundo plano con permisos de Administrador).")
+        return ActionResult(False, f"Error al iniciar limpieza: {completed.stderr}")
 
     def run_ai_plan(self, raw_command: str) -> ActionResult:
         local_commands = local_plan(raw_command)
