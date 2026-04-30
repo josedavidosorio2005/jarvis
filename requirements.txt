@@ -1,0 +1,12 @@
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+psutil>=5.9.8
+openai>=2.0.0
+pillow>=11.0.0
+requests>=2.32.0
+pyttsx3>=2.90
+SpeechRecognition>=3.10.0
+sounddevice>=0.4.6
+numpy>=1.26.0
+customtkinter>=5.2.2
+pystray>=0.19.5
