@@ -125,6 +125,29 @@ class SimpleTextResponse:
     output_text: str
 
 
+def response_text(response: Any) -> str:
+    text = getattr(response, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    choices = getattr(response, "choices", None)
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks = []
+            for part in content:
+                if isinstance(part, dict):
+                    chunks.append(str(part.get("text") or part.get("content") or ""))
+                else:
+                    chunks.append(str(getattr(part, "text", "") or getattr(part, "content", "")))
+            return "\n".join(chunk for chunk in chunks if chunk).strip()
+
+    return ""
+
+
 class OpenAIPlanner:
     def __init__(self, model: str, fallback_provider: str = "ollama", ollama_url: str = "http://localhost:11434", ollama_model: str = "deepseek-r1:8b") -> None:
         self.model = os.environ.get("OPENAI_MODEL", model)
@@ -145,7 +168,10 @@ class OpenAIPlanner:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self._client().chat.completions.create(**kwargs)
+                client = self._client()
+                if "input" in kwargs:
+                    return client.responses.create(**kwargs)
+                return client.chat.completions.create(**kwargs)
             except Exception as exc:
                 last_error = exc
                 text = str(exc).lower()
@@ -229,7 +255,7 @@ class OpenAIPlanner:
                 {"role": "user", "content": context + "\n\nOrden: " + user_text},
             ],
         )
-        text = getattr(response, "output_text", "").strip()
+        text = response_text(response)
         data = json.loads(extract_json(text))
         return [str(command) for command in data.get("commands", [])]
 
@@ -269,7 +295,7 @@ class OpenAIPlanner:
                 },
             ],
         )
-        text = getattr(response, "output_text", "").strip()
+        text = response_text(response)
         return json.loads(extract_json(text))
 
     def next_step_from_image(
@@ -322,7 +348,7 @@ class OpenAIPlanner:
                 },
             ],
         )
-        text = getattr(response, "output_text", "").strip()
+        text = response_text(response)
         return json.loads(extract_json(text))
 
     def describe_screen(self, image_path: Path, user_text: str) -> str:
@@ -333,7 +359,7 @@ class OpenAIPlanner:
         encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
         response = self.create_response(
             model=self.model,
-            messages=[
+            input=[
                 {
                     "role": "developer",
                     "content": "Describe la pantalla de Windows con foco en botones, texto visible, errores y acciones posibles. Responde en español breve.",
@@ -347,7 +373,7 @@ class OpenAIPlanner:
                 },
             ],
         )
-        return getattr(response, "output_text", "").strip() or "No pude interpretar la pantalla."
+        return response_text(response) or "No pude interpretar la pantalla."
 
 
 class Jarvis:
@@ -450,9 +476,26 @@ class Jarvis:
                 except Exception as exc:
                     return ActionResult(False, f"Falló la acción: {exc}")
 
+        local_commands = local_plan(raw_command)
+        if local_commands:
+            return self.execute_command_list(local_commands, "Plan local")
+
         if self.ai.available:
             return self.run_ai_plan(raw_command)
-        return ActionResult(False, f"No tengo ese comando todavía: {raw_command}. Si configuras OPENAI_API_KEY puedo interpretar frases libres.")
+        return ActionResult(
+            False,
+            "No pude convertir esa frase sin IA. Prueba un comando directo como "
+            "'abre gmail', 'busca noticias' o configura OPENAI_API_KEY/Ollama para frases libres.",
+        )
+
+    def execute_command_list(self, commands: list[str], title: str) -> ActionResult:
+        messages = [f"{title}: {', '.join(commands)}"]
+        for command in commands:
+            result = self.execute(command)
+            messages.append(result.message)
+            if not result.ok:
+                return ActionResult(False, "\n".join(messages))
+        return ActionResult(True, "\n".join(messages))
 
     def stop(self, _: re.Match[str]) -> ActionResult:
         self.running = False
@@ -723,21 +766,19 @@ class Jarvis:
         return ActionResult(True, f"Esperé {seconds} segundos.")
 
     def run_ai_plan(self, raw_command: str) -> ActionResult:
+        local_commands = local_plan(raw_command)
+        if local_commands:
+            return self.execute_command_list(local_commands, "Plan local")
+
         if not self.ai.available:
-            return ActionResult(False, "Para interpretar frases libres necesito OPENAI_API_KEY.")
+            return ActionResult(False, "Para interpretar frases libres necesito OPENAI_API_KEY u Ollama funcionando.")
         try:
             commands = self.ai.plan(raw_command, self.memory)
         except Exception as exc:
             return ActionResult(False, f"No pude generar el plan con IA: {exc}")
         if not commands:
             return ActionResult(False, "La IA no devolvió acciones.")
-        messages = [f"Plan: {', '.join(commands)}"]
-        for command in commands:
-            result = self.execute(command)
-            messages.append(result.message)
-            if not result.ok:
-                break
-        return ActionResult(True, "\n".join(messages))
+        return self.execute_command_list(commands, "Plan")
 
     def run_autonomous(self, goal: str) -> ActionResult:
         local_commands = local_plan(goal)
@@ -814,6 +855,7 @@ def normalize(text: str) -> str:
         "í": "i",
         "ó": "o",
         "ú": "u",
+        "ñ": "n",
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
@@ -988,6 +1030,11 @@ def should_fallback_to_ollama(exc: Exception) -> bool:
         "authentication",
         "connection",
         "timeout",
+        "model",
+        "not found",
+        "does not exist",
+        "unsupported",
+        "invalid",
     ]
     return any(needle in text for needle in needles)
 
@@ -1142,15 +1189,8 @@ def check_and_start_ollama() -> bool:
     ollama_dir = str(Path(ollama_path).parent)
     os.environ["PATH"] = ollama_dir + os.pathsep + os.environ.get("PATH", "")
 
-    # Modelos a iniciar
-    ollama_models = [
-        "openclaw",
-        "claude",
-        "codex",
-        "opencode",
-        "droid",
-        "pi"
-    ]
+    configured_model = str(load_config().get("ollama_model", "deepseek-r1:8b"))
+    ollama_models = [configured_model]
 
     print("🤖 Verificando modelos de Ollama...")
     print("   (Los modelos se descargarán la primera vez que se usen)")
@@ -1171,7 +1211,7 @@ def check_and_start_ollama() -> bool:
         if model in available_models:
             print(f"   ✓ {model} disponible")
         else:
-            print(f"   ○ {model} (se descargará cuando lo uses)")
+            print(f"   ○ {model} no aparece en 'ollama list'. Ejecuta: ollama pull {model}")
 
     print("   Listo. Ollama está configurado.")
     return True
