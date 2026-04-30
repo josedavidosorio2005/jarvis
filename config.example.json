@@ -6,6 +6,15 @@
   "max_autonomous_steps": 12,
   "autonomous_step_delay": 1.0,
   "fallback_provider": "ollama",
+  "prefer_local_ai": true,
   "ollama_url": "http://localhost:11434",
-  "ollama_model": "deepseek-r1:8b"
+  "ollama_model": "llama3.2:3b",
+  "ollama_auto_pull": true,
+  "ollama_fast_model": "qwen2.5:0.5b",
+  "ollama_num_predict": 96,
+  "ollama_keep_alive": "30m",
+  "tts_rate": 145,
+  "tts_volume": 1.0,
+  "tts_voice": "",
+  "tts_voice_keywords": ["spanish", "es-", "helena", "sabina", "laura", "maria", "zira"]
 }

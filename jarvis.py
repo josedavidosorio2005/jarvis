@@ -8,9 +8,11 @@ import json
 import os
 import platform
 import re
+import shutil
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from dataclasses import dataclass
@@ -56,10 +58,38 @@ PLUGINS_DIR = ROOT / "plugins"
 LOG_DIR = ROOT / "logs"
 
 
+def normalize_key_text(text: str) -> str:
+    text = text.strip().lower()
+    replacements = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ñ": "n",
+        "Ã¡": "a",
+        "Ã©": "e",
+        "Ã­": "i",
+        "Ã³": "o",
+        "Ãº": "u",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
 APP_ALIASES = {
     "bloc de notas": "notepad",
+    "bloc notas": "notepad",
+    "block de notas": "notepad",
+    "block notas": "notepad",
+    "blog de notas": "notepad",
+    "blo c de notas": "notepad",
+    "notas": "notepad",
     "notepad": "notepad",
     "calculadora": "calc",
+    "calcula dora": "calc",
+    "calculator": "calc",
     "paint": "mspaint",
     "explorador": "explorer",
     "terminal": "wt",
@@ -76,6 +106,8 @@ APP_ALIASES = {
     "calendario": "https://calendar.google.com",
     "spotify": "https://open.spotify.com",
 }
+
+APP_ALIAS_KEYS = {normalize_key_text(name): target for name, target in APP_ALIASES.items()}
 
 
 @dataclass
@@ -149,11 +181,28 @@ def response_text(response: Any) -> str:
 
 
 class OpenAIPlanner:
-    def __init__(self, model: str, fallback_provider: str = "ollama", ollama_url: str = "http://localhost:11434", ollama_model: str = "deepseek-r1:8b") -> None:
+    def __init__(
+        self,
+        model: str,
+        fallback_provider: str = "ollama",
+        ollama_url: str = "http://localhost:11434",
+        ollama_model: str = "llama3.2:3b",
+        ollama_auto_pull: bool = True,
+        ollama_fast_model: str = "qwen2.5:0.5b",
+        ollama_num_predict: int = 96,
+        ollama_keep_alive: str = "30m",
+        prefer_local_ai: bool = True,
+    ) -> None:
         self.model = os.environ.get("OPENAI_MODEL", model)
         self.fallback_provider = fallback_provider
         self.ollama_url = os.environ.get("OLLAMA_URL", ollama_url).rstrip("/")
         self.ollama_model = os.environ.get("OLLAMA_MODEL", ollama_model)
+        self.ollama_auto_pull = ollama_auto_pull
+        self.ollama_fast_model = os.environ.get("OLLAMA_FAST_MODEL", ollama_fast_model)
+        self.ollama_num_predict = int(os.environ.get("OLLAMA_NUM_PREDICT", ollama_num_predict))
+        self.ollama_keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE", ollama_keep_alive)
+        self.prefer_local_ai = prefer_local_ai
+        self._verified_ollama_models: set[str] = set()
 
     @property
     def available(self) -> bool:
@@ -165,6 +214,9 @@ class OpenAIPlanner:
         return OpenAI()
 
     def create_response(self, **kwargs: Any) -> Any:
+        if (self.prefer_local_ai or not os.environ.get("OPENAI_API_KEY")) and self.should_use_ollama_fallback(None):
+            return self.ollama_response_from_openai_kwargs(**kwargs)
+
         last_error: Exception | None = None
         for attempt in range(3):
             try:
@@ -204,18 +256,82 @@ class OpenAIPlanner:
         except Exception:
             return False
 
-    def ollama_chat(self, messages: list[dict[str, str]], expect_json: bool = False) -> str:
+    def local_ollama_models(self) -> list[str]:
+        if requests is None:
+            return []
+        try:
+            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return []
+        return [str(model.get("name", "")) for model in data.get("models", []) if model.get("name")]
+
+    def pull_ollama_model(self, model: str) -> None:
+        ollama_path = find_ollama_path()
+        if not ollama_path:
+            raise RuntimeError("Ollama no esta instalado. Ejecuta .\\setup_local.ps1.")
+        completed = subprocess.run(
+            [ollama_path, "pull", model],
+            text=True,
+            capture_output=True,
+            timeout=1800,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"No pude descargar el modelo local {model}: {detail}")
+
+    def ensure_ollama_model(self, preferred_model: str | None = None) -> str:
+        target_model = preferred_model or self.ollama_model
+        if target_model in self._verified_ollama_models:
+            return target_model
+        models = self.local_ollama_models()
+        if target_model in models:
+            self._verified_ollama_models.add(target_model)
+            return target_model
+        if models and not self.ollama_auto_pull:
+            self.ollama_model = models[0]
+            return self.ollama_model
+        if not self.ollama_auto_pull:
+            raise RuntimeError("Ollama esta activo, pero no hay modelos instalados. Ejecuta .\\setup_local.ps1.")
+
+        self.pull_ollama_model(target_model)
+        models = self.local_ollama_models()
+        if target_model in models:
+            self._verified_ollama_models.add(target_model)
+            return target_model
+        if models:
+            self.ollama_model = models[0]
+            return self.ollama_model
+        raise RuntimeError(f"Ollama no dejo disponible el modelo {target_model}.")
+
+    def ollama_chat(
+        self,
+        messages: list[dict[str, str]],
+        expect_json: bool = False,
+        model_override: str | None = None,
+        num_predict: int | None = None,
+    ) -> str:
         if requests is None:
             raise RuntimeError("Falta requests. Ejecuta .\\install.ps1.")
+        model = self.ensure_ollama_model(model_override)
         payload: dict[str, Any] = {
-            "model": self.ollama_model,
+            "model": model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1},
+            "keep_alive": self.ollama_keep_alive,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": num_predict or self.ollama_num_predict,
+                "num_ctx": 2048,
+            },
         }
         if expect_json:
             payload["format"] = "json"
         response = requests.post(f"{self.ollama_url}/api/chat", json=payload, timeout=180)
+        if response.status_code == 404:
+            self.pull_ollama_model(model)
+            response = requests.post(f"{self.ollama_url}/api/chat", json=payload, timeout=180)
         response.raise_for_status()
         data = response.json()
         return str(data.get("message", {}).get("content", "")).strip()
@@ -225,6 +341,27 @@ class OpenAIPlanner:
         messages, expect_json = openai_input_to_ollama_messages(input_data)
         text = self.ollama_chat(messages, expect_json=expect_json)
         return SimpleTextResponse(text)
+
+    def answer(self, user_text: str, memory: MemoryStore) -> str:
+        if (self.prefer_local_ai or not os.environ.get("OPENAI_API_KEY")) and self.fallback_provider.lower() == "ollama":
+            return self.ollama_chat(
+                [
+                    {"role": "user", "content": "En maximo 12 palabras responde en espanol: " + user_text},
+                ],
+                model_override=self.ollama_fast_model,
+                num_predict=16,
+            )
+        response = self.create_response(
+            model=self.model,
+            messages=[
+                {
+                    "role": "developer",
+                    "content": "Responde como Jarvis en espanol, rapido y directo. Maximo dos frases.",
+                },
+                {"role": "user", "content": f"Memoria:\n{memory.summary()}\n\nPregunta: {user_text}"},
+            ],
+        )
+        return response_text(response) or "No tengo respuesta."
 
     def plan(self, user_text: str, memory: MemoryStore, screen_text: str | None = None) -> list[str]:
         if not self.available:
@@ -381,6 +518,7 @@ class Jarvis:
         self.speak_enabled = speak
         self.auto_confirm = auto_confirm
         self.running = True
+        self._tts_lock = threading.Lock()
         self.config = load_config()
         LOG_DIR.mkdir(exist_ok=True)
         self.memory = MemoryStore(MEMORY_FILE)
@@ -388,15 +526,20 @@ class Jarvis:
             self.config.get("openai_model", "gpt-5.4-mini"),
             self.config.get("fallback_provider", "ollama"),
             self.config.get("ollama_url", "http://localhost:11434"),
-            self.config.get("ollama_model", "deepseek-r1:8b"),
+            self.config.get("ollama_model", "llama3.2:3b"),
+            bool(self.config.get("ollama_auto_pull", True)),
+            str(self.config.get("ollama_fast_model", "qwen2.5:0.5b")),
+            int(self.config.get("ollama_num_predict", 96)),
+            str(self.config.get("ollama_keep_alive", "30m")),
+            bool(self.config.get("prefer_local_ai", True)),
         )
         self.handlers: list[tuple[re.Pattern[str], Callable[[re.Match[str]], ActionResult]]] = [
             (re.compile(r"^(salir|terminar|apagar jarvis|cerrar jarvis)$", re.I), self.stop),
             (re.compile(r"^(ayuda|comandos)$", re.I), self.help),
             (re.compile(r"^(hora|que hora es)$", re.I), self.tell_time),
             (re.compile(r"^(fecha|que fecha es)$", re.I), self.tell_date),
-            (re.compile(r"^abre? (.+)$", re.I), self.open_target),
-            (re.compile(r"^busca(?: en internet| en google)? (.+)$", re.I), self.search_web),
+            (re.compile(r"^(?:abre|abrir|abri) (.+)$", re.I), self.open_target),
+            (re.compile(r"^(?:busca|buscar)(?: en internet| en google)? (.+)$", re.I), self.search_web),
             (re.compile(r"^escribe (.+)$", re.I), self.type_text),
             (re.compile(r"^presiona (.+)$", re.I), self.press_key),
             (re.compile(r"^atajo (.+)$", re.I), self.hotkey),
@@ -430,6 +573,12 @@ class Jarvis:
     def add_command(self, pattern: str, handler: Callable[[re.Match[str]], ActionResult]) -> None:
         self.handlers.insert(0, (re.compile(pattern, re.I), handler))
 
+    def has_direct_command(self, command: str) -> bool:
+        normalized = normalize(command)
+        if any(pattern.match(normalized) for pattern, _ in self.handlers):
+            return True
+        return bool(local_plan(normalized))
+
     def load_plugins(self) -> None:
         if not PLUGINS_DIR.exists():
             return
@@ -453,15 +602,42 @@ class Jarvis:
         def run_tts():
             try:
                 import pyttsx3
-                engine = pyttsx3.init()
-                engine.setProperty('rate', 160)
-                engine.say(text)
-                engine.runAndWait()
+                with self._tts_lock:
+                    engine = pyttsx3.init()
+                    self.configure_tts(engine)
+                    engine.say(text)
+                    engine.runAndWait()
             except Exception:
                 pass
                 
-        import threading
         threading.Thread(target=run_tts, daemon=True).start()
+
+    def configure_tts(self, engine: Any) -> None:
+        engine.setProperty("rate", int(self.config.get("tts_rate", 145)))
+        engine.setProperty("volume", float(self.config.get("tts_volume", 1.0)))
+
+        preferred_voice = str(self.config.get("tts_voice", "")).strip().lower()
+        keywords = self.config.get(
+            "tts_voice_keywords",
+            ["spanish", "es-", "helena", "sabina", "laura", "maria", "zira"],
+        )
+        voices = engine.getProperty("voices") or []
+        for voice in voices:
+            voice_id = str(getattr(voice, "id", ""))
+            voice_name = str(getattr(voice, "name", ""))
+            voice_langs = " ".join(str(lang) for lang in getattr(voice, "languages", []) or [])
+            haystack = f"{voice_id} {voice_name} {voice_langs}".lower()
+            if preferred_voice and preferred_voice in haystack:
+                engine.setProperty("voice", voice_id)
+                return
+        for voice in voices:
+            voice_id = str(getattr(voice, "id", ""))
+            voice_name = str(getattr(voice, "name", ""))
+            voice_langs = " ".join(str(lang) for lang in getattr(voice, "languages", []) or [])
+            haystack = f"{voice_id} {voice_name} {voice_langs}".lower()
+            if any(str(keyword).lower() in haystack for keyword in keywords):
+                engine.setProperty("voice", voice_id)
+                return
 
     def execute(self, raw_command: str) -> ActionResult:
         command = normalize(raw_command)
@@ -480,6 +656,9 @@ class Jarvis:
         if local_commands:
             return self.execute_command_list(local_commands, "Plan local")
 
+        if is_quick_question(command):
+            return self.answer_question(raw_command)
+
         if self.ai.available:
             return self.run_ai_plan(raw_command)
         return ActionResult(
@@ -487,6 +666,14 @@ class Jarvis:
             "No pude convertir esa frase sin IA. Prueba un comando directo como "
             "'abre gmail', 'busca noticias' o configura OPENAI_API_KEY/Ollama para frases libres.",
         )
+
+    def answer_question(self, raw_command: str) -> ActionResult:
+        if not self.ai.available:
+            return ActionResult(False, "Para responder preguntas necesito Ollama funcionando.")
+        try:
+            return ActionResult(True, self.ai.answer(raw_command, self.memory))
+        except Exception as exc:
+            return ActionResult(False, f"No pude responder con IA local: {exc}")
 
     def execute_command_list(self, commands: list[str], title: str) -> ActionResult:
         messages = [f"{title}: {', '.join(commands)}"]
@@ -539,8 +726,8 @@ class Jarvis:
         target = match.group(1).strip()
         lower = target.lower()
 
-        if lower in APP_ALIASES:
-            alias_target = APP_ALIASES[lower]
+        alias_target = APP_ALIASES.get(lower) or APP_ALIAS_KEYS.get(normalize_key_text(target))
+        if alias_target:
             if alias_target.startswith("http"):
                 webbrowser.open(alias_target)
             else:
@@ -954,6 +1141,53 @@ def can_use_fast_plan(goal: str) -> bool:
     return not any(word in lowered for word in visual_words)
 
 
+def is_quick_question(command: str) -> bool:
+    lowered = normalize(command)
+    if any(
+        lowered.startswith(prefix)
+        for prefix in (
+            "abre ",
+            "abrir ",
+            "abri ",
+            "busca ",
+            "buscar ",
+            "escribe ",
+            "presiona ",
+            "atajo ",
+            "clic",
+            "mueve mouse",
+            "captura pantalla",
+            "mira pantalla",
+            "ventana ",
+            "recuerda ",
+            "tarea ",
+            "planifica ",
+            "haz ",
+            "autonomo ",
+            "ejecuta ",
+            "pega ",
+            "copia ",
+            "lista procesos",
+        )
+    ):
+        return False
+    return lowered.endswith("?") or lowered.startswith(
+        (
+            "que ",
+            "quien ",
+            "cuando ",
+            "donde ",
+            "como ",
+            "cuanto ",
+            "cual ",
+            "dime ",
+            "explica ",
+            "responde ",
+            "cuentame ",
+        )
+    )
+
+
 def find_windows_executable(app_name: str) -> str | None:
     norm_name = normalize(app_name).replace(" ", "")
     if not norm_name:
@@ -1054,6 +1288,8 @@ def openai_input_to_ollama_messages(input_items: Any) -> tuple[list[dict[str, st
         content = item.get("content", "")
         text = content_to_text(content)
         if text:
+            if "responde solo json" in text.lower() or '"commands"' in text:
+                expect_json = True
             messages.append({"role": str(role), "content": text})
     return messages or [{"role": "user", "content": ""}], expect_json
 
@@ -1074,6 +1310,21 @@ def content_to_text(content: Any) -> str:
     return str(content)
 
 
+def find_ollama_path() -> str | None:
+    ollama_path = shutil.which("ollama")
+    if ollama_path:
+        return ollama_path
+    for path in (
+        "C:\\Users\\Usuario\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
+        os.path.expandvars("%LOCALAPPDATA%\\Programs\\Ollama\\ollama.exe"),
+    ):
+        if os.path.exists(path):
+            ollama_dir = str(Path(path).parent)
+            os.environ["PATH"] = ollama_dir + os.pathsep + os.environ.get("PATH", "")
+            return path
+    return None
+
+
 def load_config() -> dict[str, Any]:
     default = {
         "openai_model": "gpt-5.4-mini",
@@ -1083,8 +1334,17 @@ def load_config() -> dict[str, Any]:
         "max_autonomous_steps": 12,
         "autonomous_step_delay": 1.0,
         "fallback_provider": "ollama",
+        "prefer_local_ai": True,
         "ollama_url": "http://localhost:11434",
-        "ollama_model": "deepseek-r1:8b",
+        "ollama_model": "llama3.2:3b",
+        "ollama_auto_pull": True,
+        "ollama_fast_model": "qwen2.5:0.5b",
+        "ollama_num_predict": 96,
+        "ollama_keep_alive": "30m",
+        "tts_rate": 145,
+        "tts_volume": 1.0,
+        "tts_voice": "",
+        "tts_voice_keywords": ["spanish", "es-", "helena", "sabina", "laura", "maria", "zira"],
     }
     if CONFIG_FILE.exists():
         default.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
@@ -1103,10 +1363,26 @@ def interactive_loop(jarvis: Jarvis) -> None:
         jarvis.speak(result.message)
 
 
+def voice_wake_variants(wake_word: str) -> list[str]:
+    base = normalize(wake_word)
+    variants = [base]
+    if base == "jarvis":
+        variants.extend(["yarvis", "jervis", "jarbis", "jarbiz", "harvis", "charvis", "servis"])
+    return list(dict.fromkeys(variant for variant in variants if variant))
+
+
+def command_after_wake(norm_text: str, wake_variants: list[str]) -> str | None:
+    for variant in wake_variants:
+        match = re.search(rf"(?:^|\b){re.escape(variant)}(?:\b|$)", norm_text)
+        if match:
+            return norm_text[match.end():].strip(" ,.:;-")
+    return None
+
+
 def voice_loop(jarvis: Jarvis, culture: str, wake_word: str | None) -> None:
     listener = ROOT / "voice_listener_py.py"
     process = subprocess.Popen(
-        [sys.executable, str(listener)],
+        [sys.executable, str(listener), "--culture", culture],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -1117,6 +1393,7 @@ def voice_loop(jarvis: Jarvis, culture: str, wake_word: str | None) -> None:
     jarvis.speak("Iniciando escucha por voz.")
     assert process.stdout is not None
     listen_next = False
+    wake_variants = voice_wake_variants(wake_word) if wake_word else []
     for line in process.stdout:
         text = line.strip()
         if not text:
@@ -1136,8 +1413,9 @@ def voice_loop(jarvis: Jarvis, culture: str, wake_word: str | None) -> None:
             continue
             
         norm_text = normalize(text)
-        if wake_word and wake_word.lower() in norm_text:
-            command = norm_text.replace(wake_word.lower(), "", 1).strip()
+        wake_command = command_after_wake(norm_text, wake_variants) if wake_variants else None
+        if wake_command is not None:
+            command = wake_command
             if not command:
                 jarvis.speak("Sí, dime.")
                 listen_next = True
@@ -1147,6 +1425,8 @@ def voice_loop(jarvis: Jarvis, culture: str, wake_word: str | None) -> None:
             command = norm_text
             listen_next = False
         elif not wake_word:
+            command = norm_text
+        elif jarvis.has_direct_command(norm_text):
             command = norm_text
         else:
             continue
@@ -1163,33 +1443,19 @@ def voice_loop(jarvis: Jarvis, culture: str, wake_word: str | None) -> None:
 
 def check_and_start_ollama() -> bool:
     """Verifica si Ollama está instalado y ejecuta los modelos necesarios."""
-    import shutil
-
-    # Rutas posibles donde puede estar Ollama
-    ollama_paths = [
-        "C:\\Users\\Usuario\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
-        os.path.expandvars("%LOCALAPPDATA%\\Programs\\Ollama\\ollama.exe"),
-    ]
-
-    # Verificar si ollama está en el PATH o en rutas conocidas
-    ollama_path = shutil.which("ollama")
-    if not ollama_path:
-        # Buscar en rutas conocidas
-        for path in ollama_paths:
-            if os.path.exists(path):
-                ollama_path = path
-                break
+    ollama_path = find_ollama_path()
 
     if not ollama_path:
         print("⚠️ Ollama no está instalado o no está en el PATH.")
-        print("   Instala Ollama desde: https://ollama.com")
+        print("   Ejecuta .\\setup_local.ps1 para instalar dependencias y preparar el modelo local.")
         return False
 
     # Asegurar que Ollama esté en el PATH para los comandos siguientes
     ollama_dir = str(Path(ollama_path).parent)
     os.environ["PATH"] = ollama_dir + os.pathsep + os.environ.get("PATH", "")
 
-    configured_model = str(load_config().get("ollama_model", "deepseek-r1:8b"))
+    config = load_config()
+    configured_model = str(config.get("ollama_model", "llama3.2:3b"))
     ollama_models = [configured_model]
 
     print("🤖 Verificando modelos de Ollama...")
@@ -1211,7 +1477,7 @@ def check_and_start_ollama() -> bool:
         if model in available_models:
             print(f"   ✓ {model} disponible")
         else:
-            print(f"   ○ {model} no aparece en 'ollama list'. Ejecuta: ollama pull {model}")
+            print(f"   ○ {model} no aparece en 'ollama list'. Jarvis intentara descargarlo automaticamente.")
 
     print("   Listo. Ollama está configurado.")
     return True

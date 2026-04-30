@@ -66,15 +66,15 @@ En modo autonomo Jarvis mira la pantalla, decide un paso, lo ejecuta, vuelve a m
 
 El modelo por defecto está en `config.example.json`. Si quieres cambiarlo, copia ese archivo como `config.json` y edítalo. La documentación actual de OpenAI recomienda los modelos GPT-5.4 para trabajo agentico; `gpt-5.4-mini` queda como opción más barata y rápida.
 
-## Respaldo local con Ollama
+## IA local con Ollama
 
-Instala Ollama para Windows desde:
+Para dejar Jarvis funcionando con IA local, dependencias de Python, Ollama y el modelo configurado, ejecuta:
 
-```text
-https://ollama.com/download/windows
+```powershell
+.\setup_local.ps1
 ```
 
-Luego cierra y abre PowerShell, y ejecuta:
+Si solo quieres preparar Ollama:
 
 ```powershell
 .\setup_ollama.ps1
@@ -86,12 +86,15 @@ Jarvis queda configurado para usar:
 ```json
 {
   "fallback_provider": "ollama",
+  "prefer_local_ai": true,
   "ollama_url": "http://localhost:11434",
-  "ollama_model": "deepseek-r1:8b"
+  "ollama_model": "llama3.2:3b",
+  "ollama_fast_model": "qwen2.5:0.5b",
+  "ollama_auto_pull": true
 }
 ```
 
-Ollama sirve como cerebro local de texto. La vision de pantalla sigue usando OpenAI cuando esta disponible.
+Si el modelo no esta descargado, Jarvis intentara descargarlo automaticamente. Ollama sirve como cerebro local de texto. La vision de pantalla sigue usando OpenAI cuando esta disponible.
 
 ## Comandos incluidos
 
