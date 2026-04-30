@@ -6,3 +6,7 @@ screenshots/
 .env
 config.json
 memory.json
+*.spec
+build/
+dist/
+Jarvis_Portable/

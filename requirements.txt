@@ -10,3 +10,6 @@ sounddevice>=0.4.6
 numpy>=1.26.0
 customtkinter>=5.2.2
 pystray>=0.19.5
+pygetwindow>=0.0.9
+pyinstaller>=6.8.0
+pytest>=8.2.0

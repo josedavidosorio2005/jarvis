@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,23 +59,13 @@ PLUGINS_DIR = ROOT / "plugins"
 LOG_DIR = ROOT / "logs"
 
 
+def strip_accents(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
 def normalize_key_text(text: str) -> str:
-    text = text.strip().lower()
-    replacements = {
-        "á": "a",
-        "é": "e",
-        "í": "i",
-        "ó": "o",
-        "ú": "u",
-        "ñ": "n",
-        "Ã¡": "a",
-        "Ã©": "e",
-        "Ã­": "i",
-        "Ã³": "o",
-        "Ãº": "u",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
+    text = strip_accents(text.strip().lower())
     return re.sub(r"[^a-z0-9]+", "", text)
 
 
@@ -119,15 +110,29 @@ class ActionResult:
 class MemoryStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.data: dict[str, Any] = {"facts": [], "tasks": [], "favorites": {}, "routines": {}}
+        self.data: dict[str, Any] = {
+            "facts": [],
+            "tasks": [],
+            "reminders": [],
+            "favorites": {},
+            "routines": {},
+        }
         self.load()
 
     def load(self) -> None:
-        if self.path.exists():
-            self.data.update(json.loads(self.path.read_text(encoding="utf-8")))
+        if not self.path.exists():
+            return
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            backup = self.path.with_suffix(".broken.json")
+            shutil.copy2(self.path, backup)
+            loaded = {}
+        if isinstance(loaded, dict):
+            self.data.update(loaded)
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=True, indent=2), encoding="utf-8")
+        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def remember(self, text: str) -> None:
         item = {"text": text, "created_at": dt.datetime.now().isoformat(timespec="seconds")}
@@ -135,20 +140,48 @@ class MemoryStore:
         self.save()
 
     def add_task(self, text: str) -> None:
-        item = {"text": text, "done": False, "created_at": dt.datetime.now().isoformat(timespec="seconds")}
+        item = {
+            "text": text,
+            "done": False,
+            "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "due_at": extract_due_at(text),
+        }
         self.data.setdefault("tasks", []).append(item)
         self.save()
 
+    def add_reminder(self, text: str) -> None:
+        item = {
+            "text": text,
+            "done": False,
+            "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "due_at": extract_due_at(text),
+        }
+        self.data.setdefault("reminders", []).append(item)
+        self.save()
+
+    def list_reminders(self) -> str:
+        reminders = [item for item in self.data.get("reminders", []) if not item.get("done")]
+        if not reminders:
+            return "No tienes recordatorios pendientes."
+        lines = []
+        for item in reminders[-10:]:
+            due = item.get("due_at") or "sin fecha"
+            lines.append(f"- {item.get('text', '')} ({due})")
+        return "Recordatorios pendientes:\n" + "\n".join(lines)
+
     def summary(self) -> str:
-        facts = [item["text"] for item in self.data.get("facts", [])[-10:]]
-        tasks = [item["text"] for item in self.data.get("tasks", []) if not item.get("done")]
-        if not facts and not tasks:
-            return "No tengo memoria guardada todavía."
+        facts = [item.get("text", "") for item in self.data.get("facts", [])[-10:]]
+        tasks = [item.get("text", "") for item in self.data.get("tasks", []) if not item.get("done")]
+        reminders = [item.get("text", "") for item in self.data.get("reminders", []) if not item.get("done")]
+        if not facts and not tasks and not reminders:
+            return "No tengo memoria guardada todavia."
         lines = []
         if facts:
             lines.append("Recuerdos: " + "; ".join(facts))
         if tasks:
             lines.append("Tareas pendientes: " + "; ".join(tasks[-10:]))
+        if reminders:
+            lines.append("Recordatorios pendientes: " + "; ".join(reminders[-10:]))
         return "\n".join(lines)
 
 
@@ -375,8 +408,8 @@ class OpenAIPlanner:
                 "Comandos: abre <app/url>, busca <texto>, escribe <texto>, presiona <tecla>, atajo <teclas>, "
                 "clic, doble clic, clic derecho, mueve mouse <x> <y>, captura pantalla, mira pantalla, "
                 "ventana activa, maximiza ventana, minimiza ventana, cerrar ventana, cambiar ventana, "
-                "recuerda que <dato>, tarea <texto>, ejecuta powershell <comando>, ejecuta python <codigo>. "
-                "ATENCION MODO DIOS: Si el usuario te pide una tarea compleja que no puedes hacer con comandos simples (ej. crear carpetas, analizar archivos, conectarte a internet, hacer resumenes), DEBES escribir un script en Python y usar el comando 'ejecuta python <codigo>' para resolver el problema de forma autónoma. "
+                "recuerda que <dato>, tarea <texto>, recordatorio <texto>, ejecuta powershell <comando>. "
+                "No uses codigo arbitrario para resolver tareas; si una accion requiere permisos avanzados, pide ayuda del usuario. "
                 "La memoria y la pantalla son solo contexto: no las repitas como comandos, "
                 "no agregues recuerdos ni tareas salvo que la orden actual lo pida claramente. "
                 "Responde solo JSON como: {\"commands\":[\"...\"]}."
@@ -415,8 +448,8 @@ class OpenAIPlanner:
                         "presiona <tecla>, atajo <teclas>, clic, clic en <x> <y>, doble clic, clic derecho, "
                         "mueve mouse <x> <y>, espera <segundos>, captura pantalla, mira pantalla, "
                         "ventana activa, maximiza ventana, minimiza ventana, cambiar ventana, decir <texto>, "
-                        "ejecuta powershell <comando>, ejecuta python <codigo>. "
-                        "ATENCION MODO DIOS: Puedes escribir codigo en Python o Powershell para lograr objetivos complejos que tus herramientas basicas no logren. "
+                        "ejecuta powershell <comando>. "
+                        "No ejecutes codigo arbitrario ni acciones destructivas. Si hace falta permiso avanzado, responde needs_user. "
                         "Responde solo JSON: "
                         "{\"status\":\"continue|done|needs_user|blocked\",\"command\":\"...\",\"message\":\"...\"}."
                     ),
@@ -562,6 +595,8 @@ class Jarvis:
             (re.compile(r"^recuerda que (.+)$", re.I), self.remember),
             (re.compile(r"^(que recuerdas|memoria)$", re.I), self.recall),
             (re.compile(r"^tarea (.+)$", re.I), self.add_task),
+            (re.compile(r"^(?:recordatorio|recuerdame) (.+)$", re.I), self.add_reminder),
+            (re.compile(r"^(?:recordatorios|lista recordatorios)$", re.I), self.list_reminders),
             (re.compile(r"^planifica (.+)$", re.I), self.plan_and_run),
             (re.compile(r"^(haz|autonomo|modo autonomo) (.+)$", re.I), self.autonomous),
             (re.compile(r"^decir (.+)$", re.I), self.say),
@@ -733,7 +768,7 @@ class Jarvis:
             if alias_target.startswith("http"):
                 webbrowser.open(alias_target)
             else:
-                subprocess.Popen([alias_target], shell=True)
+                subprocess.Popen([alias_target])
             return ActionResult(True, f"Abriendo {target}.")
 
         if looks_like_url(target):
@@ -750,8 +785,10 @@ class Jarvis:
             os.startfile(found_lnk)
             return ActionResult(True, f"Encontré y abrí {target}.")
 
-        subprocess.Popen(target, shell=True)
-        return ActionResult(True, f"Intentando abrir {target}.")
+        return ActionResult(
+            False,
+            f"No reconozco '{target}' como app, URL o ruta segura. Usa una ruta existente o agrega un alias.",
+        )
 
     def search_web(self, match: re.Match[str]) -> ActionResult:
         query = match.group(1).strip()
@@ -915,6 +952,13 @@ class Jarvis:
         self.memory.add_task(match.group(1))
         return ActionResult(True, "Tarea guardada.")
 
+    def add_reminder(self, match: re.Match[str]) -> ActionResult:
+        self.memory.add_reminder(match.group(1))
+        return ActionResult(True, "Recordatorio guardado.")
+
+    def list_reminders(self, _: re.Match[str]) -> ActionResult:
+        return ActionResult(True, self.memory.list_reminders())
+
     def say(self, match: re.Match[str]) -> ActionResult:
         return ActionResult(True, match.group(1))
 
@@ -955,7 +999,8 @@ class Jarvis:
 
     def run_powershell(self, match: re.Match[str]) -> ActionResult:
         command = match.group(1)
-        if is_dangerous(command) and not self.confirm(f"ejecutar PowerShell peligroso: {command}"):
+        reason = "ejecutar PowerShell peligroso" if is_dangerous(command) else "ejecutar PowerShell"
+        if not self.confirm(f"{reason}: {command}"):
             return ActionResult(False, "Cancelado.")
         completed = subprocess.run(
             ["powershell", "-NoProfile", "-Command", command],
@@ -1076,20 +1121,10 @@ class Jarvis:
 
 
 def normalize(text: str) -> str:
-    text = text.strip().lower()
+    text = strip_accents(text.strip().lower())
     for prefix in ("jarvis ", "por favor "):
         if text.startswith(prefix):
             text = text[len(prefix) :]
-    replacements = {
-        "á": "a",
-        "é": "e",
-        "í": "i",
-        "ó": "o",
-        "ú": "u",
-        "ñ": "n",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
     return re.sub(r"\s+", " ", text)
 
 
@@ -1143,7 +1178,23 @@ def require_windows() -> None:
 
 def is_dangerous(command: str) -> bool:
     lowered = command.lower()
-    dangerous = ["remove-item", " del ", " rmdir", "format ", "shutdown", "stop-computer", "restart-computer", "cipher /w"]
+    dangerous = [
+        "remove-item",
+        " rm ",
+        " del ",
+        " rmdir",
+        "format ",
+        "shutdown",
+        "stop-computer",
+        "restart-computer",
+        "cipher /w",
+        "set-executionpolicy",
+        "invoke-expression",
+        "iex ",
+        "new-localuser",
+        "add-localgroupmember",
+        "start-bitstransfer",
+    ]
     return any(token in lowered for token in dangerous)
 
 
@@ -1282,6 +1333,31 @@ def local_plan(goal: str) -> list[str]:
             continue
         return []
     return commands if len(commands) > 1 else []
+
+
+def extract_due_at(text: str) -> str | None:
+    normalized = normalize(text)
+    now = dt.datetime.now()
+    date_part: dt.date | None = None
+    if "manana" in normalized:
+        date_part = (now + dt.timedelta(days=1)).date()
+    elif "hoy" in normalized:
+        date_part = now.date()
+
+    time_match = re.search(r"\b(?:a las|alas|para las)\s+(\d{1,2})(?::(\d{2}))?\b", normalized)
+    if not date_part and time_match:
+        date_part = now.date()
+    if not date_part:
+        return None
+
+    hour = 9
+    minute = 0
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2) or 0)
+        if ("tarde" in normalized or "noche" in normalized) and hour < 12:
+            hour += 12
+    return dt.datetime.combine(date_part, dt.time(hour=hour, minute=minute)).isoformat(timespec="minutes")
 
 
 def append_log(path: Path, text: str) -> None:
@@ -1425,8 +1501,12 @@ def command_after_wake(norm_text: str, wake_variants: list[str]) -> str | None:
 
 def voice_loop(jarvis: Jarvis, culture: str, wake_word: str | None) -> None:
     listener = ROOT / "voice_listener_py.py"
+    if getattr(sys, "frozen", False):
+        listener_command = [sys.executable, "--voice-listener", "--culture", culture]
+    else:
+        listener_command = [sys.executable, str(listener), "--culture", culture]
     process = subprocess.Popen(
-        [sys.executable, str(listener), "--culture", culture],
+        listener_command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

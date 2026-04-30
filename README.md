@@ -14,6 +14,12 @@ Abre PowerShell en esta carpeta y ejecuta:
 
 ## Uso
 
+Interfaz gráfica:
+
+```powershell
+.\.venv\Scripts\python.exe .\jarvis_master.py --gui
+```
+
 Modo texto:
 
 ```powershell
@@ -123,6 +129,8 @@ Si el modelo no esta descargado, Jarvis intentara descargarlo automaticamente. O
 - `recuerda que mi nombre es ...`
 - `que recuerdas`
 - `tarea comprar ...`
+- `recordatorio tomar agua hoy a las 10`
+- `recordatorios`
 - `planifica abre Gmail y busca ...`
 - `haz abre Gmail y busca ...`
 - `copia texto para el portapapeles`
@@ -134,7 +142,7 @@ Si el modelo no esta descargado, Jarvis intentara descargarlo automaticamente. O
 
 ## Seguridad
 
-Jarvis pide confirmación antes de cerrar ventanas o ejecutar comandos PowerShell peligrosos. Para automatizaciones controladas puedes pasar `--yes`, pero úsalo con cuidado:
+Jarvis pide confirmación antes de cerrar ventanas o ejecutar comandos PowerShell. La GUI bloquea PowerShell directo y acciones delicadas para evitar ejecuciones accidentales. Para automatizaciones controladas puedes pasar `--yes`, pero úsalo con cuidado:
 
 ```powershell
 .\run.ps1 --yes ejecuta powershell Get-Process
@@ -157,6 +165,42 @@ Los plugins viven en `plugins/`. Ya hay uno de productividad con:
 - `abre gmail`
 - `abre calendario`
 - `abre spotify`
+
+El plugin `god_mode.py` queda desactivado por defecto. Para ejecutar `ejecuta python ...` hay que iniciar Jarvis desde consola con la variable `JARVIS_ENABLE_GOD_MODE=1`; además bloquea operaciones destructivas comunes.
+
+## Verificación, pruebas y paquete portable
+
+Verificación real del runtime:
+
+```powershell
+.\.venv\Scripts\python.exe .\verify_functions.py
+```
+
+Pruebas automatizadas:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Crear paquete portable con `Jarvis.exe`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1
+```
+
+Salida esperada:
+
+```text
+Jarvis_Portable\Jarvis.exe
+```
+
+Comprobar el ejecutable:
+
+```powershell
+.\Jarvis_Portable\Jarvis.exe --verify
+```
+
+El repositorio incluye GitHub Actions en `.github/workflows/ci.yml` para compilar y ejecutar pruebas en Windows.
 
 ## Notas importantes
 

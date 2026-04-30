@@ -20,13 +20,16 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 try:
-    from jarvis import MEMORY_FILE, Jarvis  # type: ignore
+    from jarvis import MEMORY_FILE, Jarvis, requires_user_confirmation  # type: ignore
 
     JARVIS_AVAILABLE = True
 except ImportError as exc:
     JARVIS_AVAILABLE = False
     IMPORT_ERROR = str(exc)
     MEMORY_FILE = ROOT / "memory.json"
+
+    def requires_user_confirmation(_: str) -> bool:
+        return False
 
 CONFIG_FILE = ROOT / "config.json"
 
@@ -108,7 +111,7 @@ class JarvisGUI:
 
         self.setup_ui()
         self.write_system_status()
-        self.root.after(1000, self.toggle_voice)
+        self.refresh_runtime_status()
 
     def setup_ui(self) -> None:
         self.root.grid_columnconfigure(1, weight=1)
@@ -251,11 +254,24 @@ class JarvisGUI:
         if JARVIS_AVAILABLE:
             self.status_label.configure(text="SISTEMA ONLINE")
             self.status_dot.configure(text_color=self.colors["green"])
-            self.add_message("system", "Módulo Jarvis conectado. Subsistemas operativos.")
+            self.add_message("system", "Modulo Jarvis conectado. Voz desactivada hasta que la actives manualmente.")
         else:
             self.status_label.configure(text="SISTEMA OFFLINE")
             self.status_dot.configure(text_color=self.colors["danger"])
-            self.add_message("error", f"Error crítico al iniciar Jarvis: {IMPORT_ERROR}")
+            self.add_message("error", f"Error critico al iniciar Jarvis: {IMPORT_ERROR}")
+
+    def refresh_runtime_status(self) -> None:
+        checks = []
+        checks.append("OpenAI: listo" if os.environ.get("OPENAI_API_KEY") else "OpenAI: sin clave")
+        try:
+            import requests
+
+            response = requests.get("http://localhost:11434/api/tags", timeout=1.5)
+            checks.append("Ollama: online" if response.status_code < 400 else f"Ollama: HTTP {response.status_code}")
+        except Exception:
+            checks.append("Ollama: offline")
+        checks.append("Microfono: activar para probar")
+        self.add_message("system", "Estado: " + " | ".join(checks))
 
     def add_message(self, tag: str, message: str) -> None:
         frame = ctk.CTkFrame(self.chat_area, fg_color="transparent")
@@ -349,7 +365,17 @@ class JarvisGUI:
                 return
 
             if self.jarvis is None:
-                self.jarvis = Jarvis(speak=False, auto_confirm=True)
+                self.jarvis = Jarvis(speak=False, auto_confirm=False)
+
+            if requires_user_confirmation(command):
+                self.root.after(
+                    0,
+                    lambda: self.add_message(
+                        "error",
+                        "Este comando requiere confirmacion por seguridad. Ejecutalo desde PowerShell con .\\run.ps1.",
+                    ),
+                )
+                return
 
             result = self.jarvis.execute(command)
             tag = "jarvis" if result.ok else "error"
@@ -428,7 +454,7 @@ class JarvisGUI:
         elif lower == "memoria":
             self.open_file(MEMORY_FILE)
         elif lower.startswith("ps "):
-            self.run_command("ejecuta powershell " + value[3:].strip())
+            self.add_message("error", "PowerShell directo esta bloqueado en la GUI. Usa .\\run.ps1 para confirmar.")
         else:
             self.add_message("error", "Comando no reconocido en la consola administrativa.")
 
