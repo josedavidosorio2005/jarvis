@@ -2,7 +2,7 @@
   "openai_model": "gpt-5.4-mini",
   "assistant_name": "Jarvis",
   "wake_word": "jarvis",
-  "require_confirmation": true,
+  "require_confirmation": false,
   "max_autonomous_steps": 12,
   "autonomous_step_delay": 1.0,
   "fallback_provider": "ollama",

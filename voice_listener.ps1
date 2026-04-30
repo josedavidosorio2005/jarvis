@@ -33,9 +33,15 @@ $recognizer.LoadGrammar($dictation)
 
 Write-Output "__JARVIS_READY__$($selected.Culture.Name)"
 
-while ($true) {
-    $result = $recognizer.Recognize()
-    if ($null -ne $result -and $result.Text) {
-        Write-Output $result.Text
+Register-ObjectEvent -InputObject $recognizer -EventName "SpeechRecognized" -Action {
+    $text = $Event.SourceEventArgs.Result.Text
+    if ($text) {
+        Write-Output $text
     }
+} | Out-Null
+
+$recognizer.RecognizeAsync([System.Speech.Recognition.RecognizeMode]::Multiple)
+
+while ($true) {
+    Start-Sleep -Seconds 1
 }

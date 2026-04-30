@@ -111,6 +111,7 @@ class JarvisGUI:
 
         self.setup_ui()
         self.write_system_status()
+        self.root.after(1000, self.toggle_voice)
 
     def setup_ui(self) -> None:
         self.root.grid_columnconfigure(1, weight=1)
@@ -389,12 +390,30 @@ class JarvisGUI:
                 [sys.executable, str(ROOT / "jarvis.py"), "--voice"],
                 cwd=str(ROOT),
                 text=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                encoding="utf-8",
+                errors="replace",
             )
             self.add_message("system", "Modo voz iniciado en segundo plano. Pulsa Voz otra vez para detenerlo.")
+            threading.Thread(target=self.monitor_voice_process, daemon=True).start()
         except Exception as exc:
             messagebox.showerror("Modo voz", f"No pude iniciar el modo voz:\n{exc}")
+
+    def monitor_voice_process(self) -> None:
+        if not self.voice_process or not self.voice_process.stdout:
+            return
+        for line in self.voice_process.stdout:
+            text = line.strip()
+            if text:
+                if "Tu voz:" in text:
+                    self.root.after(0, lambda t=text: self.add_message("user", t))
+                elif "Jarvis:" in text:
+                    self.root.after(0, lambda t=text: self.add_message("jarvis", t))
+                else:
+                    self.root.after(0, lambda t=text: self.add_message("system", t))
+        self.root.after(0, lambda: self.add_message("system", "Modo voz finalizo (posible falta de reconocedor de Windows)."))
 
     def open_config(self) -> None:
         choice = simpledialog.askstring(

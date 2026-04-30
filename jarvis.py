@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+if sys.stdout and sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and sys.stderr.encoding and sys.stderr.encoding.lower() != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 try:
     import psutil
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -64,6 +69,12 @@ APP_ALIASES = {
     "edge": "msedge",
     "word": "winword",
     "excel": "excel",
+    "whatsapp": "https://web.whatsapp.com",
+    "gmail": "https://mail.google.com",
+    "youtube": "https://www.youtube.com",
+    "google": "https://www.google.com",
+    "calendario": "https://calendar.google.com",
+    "spotify": "https://open.spotify.com",
 }
 
 
@@ -134,7 +145,7 @@ class OpenAIPlanner:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self._client().responses.create(**kwargs)
+                return self._client().chat.completions.create(**kwargs)
             except Exception as exc:
                 last_error = exc
                 text = str(exc).lower()
@@ -184,7 +195,8 @@ class OpenAIPlanner:
         return str(data.get("message", {}).get("content", "")).strip()
 
     def ollama_response_from_openai_kwargs(self, **kwargs: Any) -> Any:
-        messages, expect_json = openai_input_to_ollama_messages(kwargs.get("input", []))
+        input_data = kwargs.get("messages", kwargs.get("input", []))
+        messages, expect_json = openai_input_to_ollama_messages(input_data)
         text = self.ollama_chat(messages, expect_json=expect_json)
         return SimpleTextResponse(text)
 
@@ -196,11 +208,12 @@ class OpenAIPlanner:
             "content": (
                 "Eres el cerebro de un asistente local de Windows llamado Jarvis. "
                 "Convierte la orden del usuario en una lista JSON de comandos concretos que Jarvis ya entiende. "
-                "No inventes capacidades. Si solo debes contestar, usa un comando 'decir <texto>'. "
+                "No inventes capacidades. Si el usuario hace una pregunta general o conversacional, tu unico comando debe ser 'decir <respuesta natural y concisa>'. "
                 "Comandos: abre <app/url>, busca <texto>, escribe <texto>, presiona <tecla>, atajo <teclas>, "
                 "clic, doble clic, clic derecho, mueve mouse <x> <y>, captura pantalla, mira pantalla, "
                 "ventana activa, maximiza ventana, minimiza ventana, cerrar ventana, cambiar ventana, "
-                "recuerda que <dato>, tarea <texto>, ejecuta powershell <comando>. "
+                "recuerda que <dato>, tarea <texto>, ejecuta powershell <comando>, ejecuta python <codigo>. "
+                "ATENCION MODO DIOS: Si el usuario te pide una tarea compleja que no puedes hacer con comandos simples (ej. crear carpetas, analizar archivos, conectarte a internet, hacer resumenes), DEBES escribir un script en Python y usar el comando 'ejecuta python <codigo>' para resolver el problema de forma autónoma. "
                 "La memoria y la pantalla son solo contexto: no las repitas como comandos, "
                 "no agregues recuerdos ni tareas salvo que la orden actual lo pida claramente. "
                 "Responde solo JSON como: {\"commands\":[\"...\"]}."
@@ -211,7 +224,7 @@ class OpenAIPlanner:
             context += f"\nPantalla:\n{screen_text}"
         response = self.create_response(
             model=self.model,
-            input=[
+            messages=[
                 prompt,
                 {"role": "user", "content": context + "\n\nOrden: " + user_text},
             ],
@@ -225,7 +238,7 @@ class OpenAIPlanner:
             return {"status": "blocked", "message": "Necesito OPENAI_API_KEY para modo autonomo."}
         response = self.create_response(
             model=self.model,
-            input=[
+            messages=[
                 {
                     "role": "developer",
                     "content": (
@@ -239,7 +252,8 @@ class OpenAIPlanner:
                         "presiona <tecla>, atajo <teclas>, clic, clic en <x> <y>, doble clic, clic derecho, "
                         "mueve mouse <x> <y>, espera <segundos>, captura pantalla, mira pantalla, "
                         "ventana activa, maximiza ventana, minimiza ventana, cambiar ventana, decir <texto>, "
-                        "ejecuta powershell <comando>. "
+                        "ejecuta powershell <comando>, ejecuta python <codigo>. "
+                        "ATENCION MODO DIOS: Puedes escribir codigo en Python o Powershell para lograr objetivos complejos que tus herramientas basicas no logren. "
                         "Responde solo JSON: "
                         "{\"status\":\"continue|done|needs_user|blocked\",\"command\":\"...\",\"message\":\"...\"}."
                     ),
@@ -319,7 +333,7 @@ class OpenAIPlanner:
         encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
         response = self.create_response(
             model=self.model,
-            input=[
+            messages=[
                 {
                     "role": "developer",
                     "content": "Describe la pantalla de Windows con foco en botones, texto visible, errores y acciones posibles. Responde en español breve.",
@@ -388,7 +402,7 @@ class Jarvis:
         self.load_plugins()
 
     def add_command(self, pattern: str, handler: Callable[[re.Match[str]], ActionResult]) -> None:
-        self.handlers.insert(-1, (re.compile(pattern, re.I), handler))
+        self.handlers.insert(0, (re.compile(pattern, re.I), handler))
 
     def load_plugins(self) -> None:
         if not PLUGINS_DIR.exists():
@@ -409,18 +423,19 @@ class Jarvis:
         print(f"Jarvis: {text}")
         if not self.speak_enabled:
             return
-        safe = text.replace("'", "''")
-        script = (
-            "Add-Type -AssemblyName System.Speech; "
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            "$s.Rate = 0; "
-            f"$s.Speak('{safe}')"
-        )
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", script],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        
+        def run_tts():
+            try:
+                import pyttsx3
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 160)
+                engine.say(text)
+                engine.runAndWait()
+            except Exception:
+                pass
+                
+        import threading
+        threading.Thread(target=run_tts, daemon=True).start()
 
     def execute(self, raw_command: str) -> ActionResult:
         command = normalize(raw_command)
@@ -482,7 +497,11 @@ class Jarvis:
         lower = target.lower()
 
         if lower in APP_ALIASES:
-            subprocess.Popen([APP_ALIASES[lower]], shell=True)
+            alias_target = APP_ALIASES[lower]
+            if alias_target.startswith("http"):
+                webbrowser.open(alias_target)
+            else:
+                subprocess.Popen([alias_target], shell=True)
             return ActionResult(True, f"Abriendo {target}.")
 
         if looks_like_url(target):
@@ -493,6 +512,11 @@ class Jarvis:
         if path.exists():
             os.startfile(path)  # type: ignore[attr-defined]
             return ActionResult(True, f"Abriendo {path}.")
+
+        found_lnk = find_windows_executable(target)
+        if found_lnk:
+            os.startfile(found_lnk)
+            return ActionResult(True, f"Encontré y abrí {target}.")
 
         subprocess.Popen(target, shell=True)
         return ActionResult(True, f"Intentando abrir {target}.")
@@ -888,6 +912,24 @@ def can_use_fast_plan(goal: str) -> bool:
     return not any(word in lowered for word in visual_words)
 
 
+def find_windows_executable(app_name: str) -> str | None:
+    norm_name = normalize(app_name).replace(" ", "")
+    if not norm_name:
+        return None
+    search_dirs = [
+        Path(os.environ.get("ProgramData", "C:\\ProgramData")) / "Microsoft\\Windows\\Start Menu\\Programs",
+        Path(os.environ.get("APPDATA", "")) / "Microsoft\\Windows\\Start Menu\\Programs",
+    ]
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        for lnk_file in directory.rglob("*.lnk"):
+            stem_norm = normalize(lnk_file.stem).replace(" ", "")
+            if norm_name in stem_norm or stem_norm in norm_name:
+                return str(lnk_file)
+    return None
+
+
 def local_plan(goal: str) -> list[str]:
     text = normalize(goal)
     parts = [part.strip() for part in re.split(r"\s+y\s+|\s+luego\s+|\s+despues\s+", text) if part.strip()]
@@ -929,6 +971,7 @@ def append_log(path: Path, text: str) -> None:
 
 
 def extract_json(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     match = re.search(r"\{.*\}", text, re.S)
     return match.group(0) if match else text
 
@@ -963,8 +1006,6 @@ def openai_input_to_ollama_messages(input_items: Any) -> tuple[list[dict[str, st
             role = "system"
         content = item.get("content", "")
         text = content_to_text(content)
-        if "responde solo json" in text.lower() or "json" in text.lower():
-            expect_json = True
         if text:
             messages.append({"role": str(role), "content": text})
     return messages or [{"role": "user", "content": ""}], expect_json
@@ -1016,16 +1057,19 @@ def interactive_loop(jarvis: Jarvis) -> None:
 
 
 def voice_loop(jarvis: Jarvis, culture: str, wake_word: str | None) -> None:
-    listener = ROOT / "voice_listener.ps1"
+    listener = ROOT / "voice_listener_py.py"
     process = subprocess.Popen(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(listener), "-Culture", culture],
+        [sys.executable, str(listener)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        encoding="utf-8",
+        errors="replace",
     )
     jarvis.speak("Iniciando escucha por voz.")
     assert process.stdout is not None
+    listen_next = False
     for line in process.stdout:
         text = line.strip()
         if not text:
@@ -1043,12 +1087,27 @@ def voice_loop(jarvis: Jarvis, culture: str, wake_word: str | None) -> None:
         if text == "__JARVIS_MIC_ERROR__":
             jarvis.speak("No pude acceder al micrófono.")
             continue
-        if wake_word and wake_word.lower() not in normalize(text):
+            
+        norm_text = normalize(text)
+        if wake_word and wake_word.lower() in norm_text:
+            command = norm_text.replace(wake_word.lower(), "", 1).strip()
+            if not command:
+                jarvis.speak("Sí, dime.")
+                listen_next = True
+                continue
+            listen_next = False
+        elif listen_next:
+            command = norm_text
+            listen_next = False
+        elif not wake_word:
+            command = norm_text
+        else:
             continue
-        if wake_word:
-            text = normalize(text).replace(wake_word.lower(), "", 1).strip()
-        print(f"Tu voz: {text}")
-        result = jarvis.execute(text)
+            
+        print(f"Tu voz: {command}")
+        if not command:
+            continue
+        result = jarvis.execute(command)
         jarvis.speak(result.message)
         if not jarvis.running:
             process.terminate()
